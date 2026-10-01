@@ -72,6 +72,9 @@ See [Example: Using ChatGPT to manually create profiles for Gaggimate by Dule Ra
 
 ## Changelog
 
+### 2026-10-01
+- **Fix corrupted telemetry on firmware shot-log v6/v7**: The parser assumed 2 bytes per recorded field, but v6 widened the timestamp to `uint32` ms (28-byte samples) and v7 added a cumulative water-pumped field `wp` (30-byte samples). Newer shots were decoded at the wrong boundaries, giving nonsense temperatures, pressures and timestamps. Parser now uses per-version field widths, exposes `wp` (raw, unit unconfirmed), and rejects unknown log versions or field bits instead of returning garbage.
+
 ### 2026-04-22
 - **Channeling indicators v2**: Rewrote the channeling-risk computation around four independent indicators, each catching a specific physical signature, with descriptor fields separated from scored indicators.
   - **Window trim (V4)**: After the existing pressure-ramp trim, also strips leading & trailing zero-flow samples (valve-closed at entry, volumetric-cutoff at exit). Eliminates the class of false-positive HIGH ratings caused by trapped-pressure tails.

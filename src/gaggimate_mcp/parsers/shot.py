@@ -12,6 +12,9 @@ from typing import Optional
 HEADER_SIZE_V4 = 128
 HEADER_SIZE_V5 = 512
 MAGIC = 0x544F4853  # 'SHOT'
+MAX_SUPPORTED_VERSION = 7
+# v6+ stores `t` as uint32 elapsed milliseconds (v1-v5: uint16 sample index)
+T_MS_VERSION = 6
 
 # Scaling factors
 TEMP_SCALE = 10
@@ -35,7 +38,13 @@ FIELD_BITS = {
     'EV': 10,  # estimated weight
     'PR': 11,  # puck resistance
     'SI': 12,  # system info (v2+)
+    'WP': 13,  # cumulative water pumped (v7+)
 }
+KNOWN_FIELD_MASK = (1 << (max(FIELD_BITS.values()) + 1)) - 1
+
+STRUCT_FORMATS = {'uint16': '<H', 'int16': '<h', 'uint32': '<I'}
+FIELD_WIDTHS = {name: struct.calcsize(fmt) for name, fmt in STRUCT_FORMATS.items()}
+WP_VERSION = 7  # `wp` (bit 13) first appears in v7
 
 
 @dataclass
@@ -77,7 +86,19 @@ FIELD_DEFS = {
             'extended_recording': bool(val & 0x0010),
         }
     ),
+    # Unit/scale not documented in firmware header; exposed raw.
+    FIELD_BITS['WP']: FieldDef(name='wp', field_type='uint16'),
 }
+
+
+def field_defs_for_version(version: int) -> dict[int, FieldDef]:
+    """Field definitions for a log version (v6+ widens `t` to uint32 ms)."""
+    if version < T_MS_VERSION:
+        return FIELD_DEFS
+    return {
+        **FIELD_DEFS,
+        FIELD_BITS['T']: FieldDef(name='t', field_type='uint32'),
+    }
 
 
 @dataclass
@@ -127,15 +148,6 @@ def decode_c_string(data: bytes) -> str:
     return data[:null_pos].decode('utf-8', errors='ignore')
 
 
-def count_set_bits(n: int) -> int:
-    """Count number of set bits in integer."""
-    count = 0
-    while n:
-        count += n & 1
-        n >>= 1
-    return count
-
-
 def parse_binary_shot(data: bytes, shot_id: str) -> ShotData:
     """Parse binary shot file (.slog format).
 
@@ -167,6 +179,11 @@ def parse_binary_shot(data: bytes, shot_id: str) -> ShotData:
         raise ValueError(f"Invalid shot magic: 0x{magic:08x} (expected 0x{MAGIC:08x})")
 
     version = struct.unpack_from('<B', data, 4)[0]
+    if version < 1 or version > MAX_SUPPORTED_VERSION:
+        raise ValueError(
+            f"Unsupported shot log version {version} "
+            f"(parser supports 1-{MAX_SUPPORTED_VERSION})"
+        )
     header_size = HEADER_SIZE_V5 if version >= 5 else HEADER_SIZE_V4
 
     if len(data) < header_size:
@@ -206,28 +223,52 @@ def parse_binary_shot(data: bytes, shot_id: str) -> ShotData:
                 phase_name=phase_name
             ))
 
-    # Calculate sample data size
-    fields_per_sample = count_set_bits(fields_mask)
-    if fields_per_sample == 0:
-        raise ValueError(f"Invalid shot file: fields_mask is 0 (no fields recorded)")
-    sample_data_size = fields_per_sample * 2  # Each field is 2 bytes
+    # Build field order and per-sample stride from the mask. Widths are
+    # version-dependent, so an unknown bit means we cannot know the stride.
+    if fields_mask == 0:
+        raise ValueError("Invalid shot file: fields_mask is 0 (no fields recorded)")
+    unknown_bits = fields_mask & ~KNOWN_FIELD_MASK
+    if unknown_bits:
+        raise ValueError(
+            f"Unknown field bits in fields_mask: 0x{unknown_bits:08x} "
+            "(parser cannot determine sample layout)"
+        )
+
+    if version < WP_VERSION and fields_mask & (1 << FIELD_BITS['WP']):
+        raise ValueError(
+            f"Field 'wp' (bit {FIELD_BITS['WP']}) is not valid in shot log version {version}"
+        )
+
+    field_defs = field_defs_for_version(version)
+    field_order = [bit for bit in range(KNOWN_FIELD_MASK.bit_length()) if fields_mask & (1 << bit)]
+    sample_data_size = sum(FIELD_WIDTHS[field_defs[bit].field_type] for bit in field_order)
+
+    # Cross-check the stride against the layout the header declares (v5+:
+    # sample size at offset 5, header size at offset 6). Zero means unset.
+    if version >= 5:
+        declared_sample_size = data[5]
+        if declared_sample_size and declared_sample_size != sample_data_size:
+            raise ValueError(
+                f"Sample size mismatch: header declares {declared_sample_size} bytes, "
+                f"fields_mask 0x{fields_mask:x} implies {sample_data_size} (version {version})"
+            )
+        declared_header_size = struct.unpack_from('<H', data, 6)[0]
+        if declared_header_size and declared_header_size != header_size:
+            raise ValueError(
+                f"Header size mismatch: header declares {declared_header_size} bytes, "
+                f"version {version} implies {header_size}"
+            )
 
     # Determine actual samples (handle truncated files)
     available_data = len(data) - header_size
     actual_sample_count = min(sample_count, available_data // sample_data_size)
     incomplete = actual_sample_count < sample_count
 
-    # Build field order based on mask
-    field_order = []
-    for bit in range(13):
-        if fields_mask & (1 << bit):
-            field_order.append(bit)
-
     # Parse samples
     samples = []
     for i in range(actual_sample_count):
         sample = {}
-        sample_offset = header_size + i * sample_data_size
+        field_offset = header_size + i * sample_data_size
 
         # Add phase number based on transitions
         for phase in reversed(phases):
@@ -236,18 +277,10 @@ def parse_binary_shot(data: bytes, shot_id: str) -> ShotData:
                 break
 
         # Parse each field in this sample
-        for field_index, field_bit in enumerate(field_order):
-            field_def = FIELD_DEFS.get(field_bit)
-            if not field_def:
-                continue
-
-            field_offset = sample_offset + field_index * 2
-
-            # Read value based on type
-            if field_def.field_type == 'int16':
-                value = struct.unpack_from('<h', data, field_offset)[0]
-            else:  # uint16 or uint8
-                value = struct.unpack_from('<H', data, field_offset)[0]
+        for field_bit in field_order:
+            field_def = field_defs[field_bit]
+            value = struct.unpack_from(STRUCT_FORMATS[field_def.field_type], data, field_offset)[0]
+            field_offset += FIELD_WIDTHS[field_def.field_type]
 
             # Apply transform or scale
             if field_def.transform:
